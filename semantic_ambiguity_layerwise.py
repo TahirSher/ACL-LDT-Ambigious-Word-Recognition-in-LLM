@@ -67,6 +67,15 @@ INSTALL
   pip install "torch>=2.2" "transformers>=4.53" "tokenizers>=0.19" accelerate numpy pandas scipy matplotlib
   pip install statsmodels scikit-learn      # optional: reference checks in --self_test
   huggingface-cli login                     # Llama models are gated: accept the licence first
+  (optional) pdflatex + booktabs            # lets --self_test compile the LaTeX tables and figures
+
+OUTPUTS (under --output_dir)
+  REPORT.md                 every result, limitation and not-run analysis, with reasons
+  tables/*.csv              all result tables (machine-readable)
+  tables/latex/*.tex        booktabs table* floats that fit the ACL text width (16 cm)
+  figures/*.pdf|.png        figures at the ACL text width, embedded TrueType text,
+                            300-dpi PNG and a _caption.txt per figure
+  item_scores/, cache/, logs/, models/, prompts/   per-item scores, caches, provenance
 
 USAGE
   python semantic_ambiguity_layerwise.py --self_test
@@ -2522,7 +2531,12 @@ def evaluate_hypotheses(designs: dict, points: dict, boots: dict, depth: np.ndar
                              ci90_low=float(lo90), ci90_high=float(hi90), p_two_sided=p_normal(est, se),
                              p_tost=p_tost_normal(est, se, cfg.sesoi_std) if kind == 'equivalence' else np.nan,
                              sesoi_std=cfg.sesoi_std if kind == 'equivalence' else np.nan, n=d.n,
-                             n_boot_valid=len(bv)))
+                             n_boot_valid=len(bv),
+                             # sensitivity (Lakens, 2022): smallest effect the unadjusted two-sided test detects
+                             # with 80% power at this SE; TOST can succeed only if z(1−α)·SE < SESOI (estimate 0)
+                             mde80=float((stats.norm.ppf(1 - cfg.alpha / 2) + stats.norm.ppf(0.8)) * se),
+                             equivalence_attainable=(bool(stats.norm.ppf(1 - cfg.alpha) * se < cfg.sesoi_std)
+                                                     if kind == 'equivalence' else None)))
     df = pd.DataFrame(rows)
     if df.empty:
         return df
@@ -3404,6 +3418,8 @@ def _run_analyses(cfg, conds: dict, samples: Samples, context_df, dirs) -> dict:
     for name, df in T.items():
         if df is not None and len(df):
             write_csv(df, os.path.join(dirs['tables'], f'{name}.csv'))
+    test = any(x.model_info.get('test_model_random_weights') for x in sets)
+    res['latex_tables'] = make_publication_tables(cfg, T, samples, dirs, test)
     if cfg.run_figures:
         res['figures'] = make_figures(cfg, T, sets, samples, dirs)
     return res
@@ -3469,205 +3485,492 @@ def not_run_registry(cfg, T: dict) -> dict:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# FIGURES (drawn only from analyses that ran; never placeholders)
+# PUBLICATION FIGURES — vector PDF (embedded TrueType) + 300-dpi PNG at ACL
+# column widths, captions as sidecar files; drawn only from analyses that ran
 # ════════════════════════════════════════════════════════════════════════════
-VIZ = {'surface': '#fcfcfb', 'text': '#0b0b0b', 'text2': '#52514e', 'grid': '#e6e5e0', 'zero': '#a3a29c',
-       # categorical slots 1–3 of the reference palette (validated all-pairs); colour follows the ENTITY
+FIG_W = 16.0 / 2.54                                   # inches: ACL text width (16 cm); figures are saved at it
+VIZ = {'text': '#0b0b0b', 'text2': '#52514e', 'grid': '#e6e5e0', 'zero': '#8f8e88', 'warn': '#d03b3b',
+       'summary_output': '#8a6bbd',                     # fig. 4: output layer vs deep-region mean (black)
+       # categorical slots 1–3 of the reference palette (validated all-pairs); colour follows the CONSTRUCT
        'frequency': '#2a78d6', 'meanings': '#eb6834', 'senses': '#1baf7a',
        'ramp': ['#86b6ef', '#2a78d6', '#104281']}          # ordinal blue ramp for frequency tertiles
-TERM_STYLE = {'log_subtlex': ('frequency (log_subtlex)', VIZ['frequency']),
-              'gcide_etymologies': ('meanings proxy (gcide_etymologies)', VIZ['meanings']),
-              'ambiguity': ('meanings (published factor)', VIZ['meanings']),
-              'wn_n_all': ('senses proxy (wn_n_all)', VIZ['senses']),
-              'senses': ('senses (published factor)', VIZ['senses'])}
+TERM_STYLE = {'log_subtlex': ('Frequency (log SUBTLEX)', VIZ['frequency']),
+              'gcide_etymologies': ('Meanings proxy (GCIDE etymologies)', VIZ['meanings']),
+              'ambiguity': ('Meanings (published factor)', VIZ['meanings']),
+              'wn_n_all': ('Senses proxy (WordNet senses)', VIZ['senses']),
+              'senses': ('Senses (published factor)', VIZ['senses'])}
+HYP_SHORT = {'S1A_meanings': 'A-M', 'S1A_senses': 'A-S', 'S1B_senses': 'B-S', 'S1B_meanings_null': 'B-M0',
+             'S1B_separation': 'B-Sep', 'S1C_senses': 'C-S', 'S1C_meanings': 'C-M', 'S1C_separation': 'C-Sep',
+             'S2_meanings': '2-M', 'S2_senses': '2-S', 'S2_frequency': '2-F', 'S2_separation': '2-Sep',
+             'D_frequency_shallow': 'D-F', 'D_meanings_deep': 'D-M', 'D_senses_deep': 'D-S',
+             'D_meanings_vs_frequency': 'D-M>F', 'D_senses_vs_frequency': 'D-S>F'}
+HYP_COLOR = {h[0]: (VIZ['frequency'] if 'frequency' in h[0] and 'vs' not in h[0] else
+                    VIZ['meanings'] if 'meanings' in h[0] else VIZ['senses'] if 'senses' in h[0] else VIZ['text'])
+             for h in HYPOTHESES}
+EVIDENCE_MARK = {'supported': 'S', 'supported (equivalent to zero within ±SESOI)': 'E', 'contradicted': 'C',
+                 'contradicted (non-zero effect)': 'C', 'inconclusive': '·'}
 
 
 def _plt():
     import matplotlib
     matplotlib.use('Agg', force=True)
     import matplotlib.pyplot as plt
-    plt.rcParams.update({'figure.facecolor': VIZ['surface'], 'axes.facecolor': VIZ['surface'],
-                         'savefig.facecolor': VIZ['surface'], 'axes.edgecolor': VIZ['grid'],
-                         'axes.labelcolor': VIZ['text2'], 'xtick.color': VIZ['text2'], 'ytick.color': VIZ['text2'],
-                         'text.color': VIZ['text'], 'font.size': 8.5, 'axes.titlesize': 9,
-                         'axes.titleweight': 'bold', 'legend.frameon': False, 'lines.linewidth': 1.6})
+    plt.rcParams.update({
+        'font.family': 'sans-serif', 'font.sans-serif': ['DejaVu Sans', 'Arial', 'Helvetica'], 'font.size': 8,
+        'axes.titlesize': 8, 'axes.titleweight': 'bold', 'axes.labelsize': 8, 'xtick.labelsize': 7,
+        'ytick.labelsize': 7, 'legend.fontsize': 7, 'legend.frameon': False, 'axes.linewidth': 0.6,
+        'xtick.major.width': 0.6, 'ytick.major.width': 0.6, 'lines.linewidth': 1.2, 'axes.edgecolor': VIZ['text2'],
+        'axes.labelcolor': VIZ['text'], 'xtick.color': VIZ['text2'], 'ytick.color': VIZ['text2'],
+        'text.color': VIZ['text'], 'figure.facecolor': 'white', 'axes.facecolor': 'white',
+        'savefig.facecolor': 'white', 'pdf.fonttype': 42, 'ps.fonttype': 42, 'axes.spines.top': False,
+        'axes.spines.right': False})
     return plt
 
 
-def _grid(plt, n, w=3.3, h=2.5):
-    ncols = min(4, max(1, n))
-    fig, axes = plt.subplots(int(math.ceil(n / ncols)), ncols, figsize=(w * ncols, h * math.ceil(n / ncols) + 0.9),
-                             squeeze=False)
-    for ax in axes.flat[n:]:
-        ax.set_visible(False)
-    for ax in axes.flat[:n]:
-        ax.spines[['top', 'right']].set_visible(False)
-        ax.grid(axis='y', color=VIZ['grid'], linewidth=0.6)
-        ax.set_axisbelow(True)
-        ax.set_xlim(0, 1.0)
-    return fig, axes.flat
+def _model_order(models) -> list:
+    reg = [m.alias for m in MODEL_REGISTRY + TEST_MODEL_REGISTRY]
+    return sorted(set(models), key=lambda m: (reg.index(m) if m in reg else len(reg), m))
 
 
-def _finish(fig, plt, path, title, subtitle, handles=None):
-    import textwrap
-    W, H = fig.get_figwidth(), fig.get_figheight()
-    sub = '\n'.join(textwrap.wrap(subtitle, width=max(40, int(W * 15.5))))
-    fig.text(0.01, 1 - 0.12 / H, title, ha='left', va='top', fontsize=11, fontweight='bold', color=VIZ['text'])
-    fig.text(0.01, 1 - 0.42 / H, sub, ha='left', va='top', fontsize=8, color=VIZ['text2'], linespacing=1.35)
-    if handles:
-        fig.legend(handles=handles, loc='lower center', ncol=len(handles), fontsize=8, bbox_to_anchor=(0.5, 0.08 / H))
-    fig.tight_layout(rect=(0, (0.40 if handles else 0.05) / H, 1, 1 - (0.55 + 0.16 * (sub.count('\n') + 1)) / H))
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-
-
-def _line(ax, x, y, lo, hi, color, label):
-    ax.plot(x, y, color=color, label=label)
-    if lo is not None and np.isfinite(lo).any():
-        ax.fill_between(x, lo, hi, color=color, alpha=0.13, linewidth=0)
-
-
-def _guides(ax, zero=True):
+def _depth_axes(ax, ylabel: str, zero: bool = True, xlabel: bool = True):
+    ax.grid(axis='y', color=VIZ['grid'], linewidth=0.5)
+    ax.set_axisbelow(True)
     if zero:
-        ax.axhline(0, color=VIZ['zero'], linewidth=0.8)
+        ax.axhline(0, color=VIZ['zero'], linewidth=0.6)
     for x in (1 / 3, 2 / 3):
-        ax.axvline(x, color=VIZ['zero'], linewidth=0.6, linestyle=':')
+        ax.axvline(x, color=VIZ['zero'], linewidth=0.5, linestyle=':')
+    ax.set_xlim(0, 1)
+    ax.set_xticks([0, 1 / 3, 2 / 3, 1])
+    ax.set_xticklabels(['0', '⅓', '⅔', '1'])
+    ax.set_xlabel('Normalised depth' if xlabel else '')
+    ax.set_ylabel(ylabel)
+
+
+def _save(fig, plt, dirs: dict, name: str, caption: str, test: bool) -> str:
+    if test:
+        fig.text(0.5, 0.5, 'TEST MODELS — NOT RESULTS', ha='center', va='center', rotation=18, fontsize=16,
+                 color=VIZ['warn'], alpha=0.25)
+    base = os.path.join(dirs['figures'], name)
+    fig.savefig(base + '.pdf')                         # no tight bbox: keep the exact text width, so fonts are
+    fig.savefig(base + '.png', dpi=300)                # printed at their nominal size with width=\textwidth
+    atomic_write_text(base + '_caption.txt', caption + (' TEST MODELS WITH RANDOM WEIGHTS: these values are pipeline '
+                                                        'checks, NOT RESULTS.' if test else ''))
+    plt.close(fig)
+    return base + '.pdf'
+
+
+def _curves(df: pd.DataFrame, term: str, sign: float = 1.0) -> dict:
+    out = {}
+    for m, g in df[df['term'] == term].groupby('model'):
+        g = g.sort_values('depth')
+        lo, hi = sign * g['boot_ci_std_low'].values, sign * g['boot_ci_std_high'].values
+        out[m] = (g['depth'].values, sign * g['beta_std'].values, np.minimum(lo, hi), np.maximum(lo, hi))
+    return out
+
+
+def _plot_curves(ax, curves: dict, color: str):
+    """One model: line + 95% bootstrap band. Several models: thin per-model lines and
+    the across-model median on a common depth grid (descriptive; models share items)."""
+    if len(curves) == 1:
+        x, y, lo, hi = next(iter(curves.values()))
+        ax.fill_between(x, lo, hi, color=color, alpha=0.18, linewidth=0)
+        ax.plot(x, y, color=color, linewidth=1.6)
+        return
+    grid = np.linspace(0.05, 1.0, 39)
+    M = []
+    for x, y, _, _ in curves.values():
+        ax.plot(x, y, color=color, alpha=0.35, linewidth=0.7)
+        M.append(np.interp(grid, x, y, left=np.nan))
+    M = np.array(M)
+    enough = np.isfinite(M).sum(0) >= 2
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        ax.plot(grid[enough], np.nanmedian(M[:, enough], 0), color=color, linewidth=2.0)
+
+
+def _axis_power(df: pd.DataFrame) -> int:
+    """Power of ten k such that CI limits / 10^k stay below 100 with short tick labels (k = 0 unless tiny)."""
+    m = float(np.nanmax(np.abs(df[['ci95_low', 'ci95_high']].values))) if len(df) else 0.0
+    return int(np.floor(np.log10(m))) if 0 < m < 0.1 else 0
+
+
+def _forest(ax, rows: pd.DataFrame, models: list, color: str, offset: float = 0.0, power: int = 0):
+    """Point estimate + 95% CI per model, in units of 10^power. Marker encodes the Holm-corrected
+    evidence: filled circle = supported, triangle = contradicted, open circle = inconclusive."""
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+    y = {m: i for i, m in enumerate(models)}
+    u = 10.0 ** power
+    for _, r in rows.iterrows():
+        yy = y[r['model']] + offset
+        ax.plot([r['ci95_low'] / u, r['ci95_high'] / u], [yy, yy], color=color, linewidth=1.0)
+        ev = r['evidence']
+        ax.plot(r['estimate'] / u, yy, marker='^' if ev.startswith('contradicted') else 'o', markersize=4.2,
+                markerfacecolor='white' if ev == 'inconclusive' else color, markeredgecolor=color,
+                markeredgewidth=0.9, linestyle='none')
+    ax.axvline(0, color=VIZ['zero'], linewidth=0.6)
+    ax.xaxis.set_major_locator(MaxNLocator(nbins=3))
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f'{v:.2g}'.replace('-', '−')))
+    ax.set_yticks(range(len(models)))
+    ax.set_ylim(len(models) - 0.5, -0.5)
+    ax.grid(axis='x', color=VIZ['grid'], linewidth=0.5)
+    ax.set_axisbelow(True)
 
 
 def make_figures(cfg, T: dict, sets: list, samples: Samples, dirs: dict) -> list:
-    plt = _plt()
     from matplotlib.colors import LinearSegmentedColormap
     from matplotlib.lines import Line2D
+    plt = _plt()
     made = []
     pc, pa = cfg.primary_condition, cfg.primary_aggregate
-    test_note = ' — TEST MODELS (random weights): NOT RESULTS' if any(
-        s.model_info.get('test_model_random_weights') for s in sets) else ''
-    sub = (f"condition={pc}, aggregate={pa}; surprisal in bits; depth=(block+1)/L; final layer = model output, "
-           f"earlier layers = logit-lens estimates; dotted lines = shallow/middle/deep{test_note}")
-    s2 = T.get('stage2_wordnet_derived', pd.DataFrame())
-    s2p = s2[(s2['condition'] == pc) & (s2['aggregate'] == pa) & (s2['spec'] == 'primary') &
-             (s2['zero_policy'] == cfg.gcide_zero_policy)] if len(s2) else s2
-    models = sorted(s2p['model'].unique()) if len(s2p) else []
-    prim = sorted([s for s in sets if s.condition == pc and _lens_available(s)], key=lambda s: s.alias)
+    test = any(s.model_info.get('test_model_random_weights') for s in sets)
+    common = (f'Surprisal: logit-lens estimates at intermediate blocks, model output at the final block; aggregate '
+              f'"{pa}" (bits); condition "{pc}". Depth = (block index + 1) / number of blocks; dotted lines separate '
+              f'the prespecified shallow, middle and deep regions.')
+    sel = lambda df: df[(df['condition'] == pc) & (df['aggregate'] == pa)] if len(df) else df
+    s1 = sel(pd.concat([T.get('stage1_published_appendix_B', pd.DataFrame()),
+                        T.get('stage1_published_appendix_C', pd.DataFrame())], ignore_index=True))
+    s1 = s1[s1['spec'] == 'factorial'] if len(s1) else s1
+    if len(s1):
+        fig, axes = plt.subplots(2, 2, figsize=(FIG_W, 3.9), sharex=True, layout='constrained')
+        for k, (ax, (an, term, title)) in enumerate(zip(axes.flat, (
+                ('stage1_B', 'ambiguity', 'Exp. 2 (visual)\nmeanings: ambiguous − unambiguous'),
+                ('stage1_B', 'senses', 'Exp. 2 (visual)\nsenses: many − few'),
+                ('stage1_C', 'ambiguity', 'Exp. 3 (auditory; text input)\nmeanings: ambiguous − unambiguous'),
+                ('stage1_C', 'senses', 'Exp. 3 (auditory; text input)\nsenses: many − few')))):
+            _plot_curves(ax, _curves(s1[s1['analysis'] == an], term), TERM_STYLE[term][1])
+            _depth_axes(ax, 'Effect (SD of surprisal)' if k % 2 == 0 else '', xlabel=k >= 2)
+            ax.set_title(title, loc='left')
+        n = s1['model'].nunique()
+        made.append(_save(fig, plt, dirs, 'fig1_stage1_meanings_senses_by_depth',
+                          'Stage 1 (published Rodd et al., 2002 items): effect of the meanings and senses factors on '
+                          'target surprisal across depth, in SD of surprisal (positive = higher surprisal). ' +
+                          ('Band = 95% stratified bootstrap CI over words. ' if n == 1 else
+                           f'Thin lines = {n} models; thick line = across-model median (descriptive; models share '
+                           'items). ') + 'Human pattern for sign comparison only: senses negative; meanings null '
+                          '(Exp. 2) / positive (Exp. 3). ' + common, test))
+    s2 = sel(T.get('stage2_wordnet_derived', pd.DataFrame()))
+    if len(s2):
+        s2 = s2[(s2['spec'] == 'primary') & (s2['zero_policy'] == cfg.gcide_zero_policy)]
+    if len(s2):
+        variants = [v for v in ('base', 'instruct') if (s2['variant'] == v).any()]
+        terms = ['log_subtlex', 'gcide_etymologies', 'wn_n_all']
+        fig, axes = plt.subplots(len(variants), 3, figsize=(FIG_W, 1.9 * len(variants) + 0.4),
+                                 sharex=True, sharey='row', squeeze=False, layout='constrained')
+        short = {'log_subtlex': 'Frequency\n(log SUBTLEX)', 'gcide_etymologies': 'Meanings proxy\n(GCIDE etymologies)',
+                 'wn_n_all': 'Senses proxy\n(WordNet senses)'}
+        for i, v in enumerate(variants):
+            for j, t in enumerate(terms):
+                ax = axes[i][j]
+                _plot_curves(ax, _curves(s2[s2['variant'] == v], t, ORIENT[t]), TERM_STYLE[t][1])
+                _depth_axes(ax, f'{v.capitalize()} models\noriented effect (SD)' if j == 0 else '',
+                            xlabel=i == len(variants) - 1)
+                ax.set_title(short[t] if i == 0 else '', loc='left')
+        made.append(_save(fig, plt, dirs, 'fig2_stage2_frequency_meanings_senses_by_depth',
+                          'Stage 2 (WordNet-derived pool; generalisation on computed proxies, not a replication): '
+                          'oriented standardised coefficients (positive = the human-like direction: frequency and '
+                          'senses facilitating, meanings inhibiting) from y_k ~ gcide_etymologies + wn_n_all + '
+                          f'log_subtlex + length + concreteness (gcide zero policy: {cfg.gcide_zero_policy}). '
+                          'Thin lines = individual models; thick = across-model median, or a 95% bootstrap band '
+                          'when one model is shown. ' + common, test))
+    conf = T.get('confirmatory_hypothesis_tests', pd.DataFrame())
+    if len(conf):
+        models = _model_order(conf['model'])
+        handles = [Line2D([], [], marker='o', color=VIZ['text2'], markerfacecolor=VIZ['text2'], linestyle='none',
+                          label='supported (Holm)'),
+                   Line2D([], [], marker='o', color=VIZ['text2'], markerfacecolor='white', linestyle='none',
+                          label='inconclusive'),
+                   Line2D([], [], marker='^', color=VIZ['text2'], markerfacecolor=VIZ['text2'], linestyle='none',
+                          label='contradicted (Holm)')]
+        dh = [h[0] for h in HYPOTHESES if h[5] == 'depth_hypothesis']
+        d = conf[conf['hypothesis'].isin(dh)]
+        if len(d):
+            fig, axes = plt.subplots(1, len(dh), figsize=(FIG_W, 0.2 * len(models) + 1.3),
+                                     sharey=True, squeeze=False, layout='constrained')
+            k = _axis_power(d)
+            for ax, h in zip(axes[0], dh):
+                _forest(ax, d[d['hypothesis'] == h], models, HYP_COLOR[h], power=k)
+                ax.set_title({'D_frequency_shallow': 'Frequency\n(pred. < 0)',
+                              'D_meanings_deep': 'Meanings\n(pred. > 0)',
+                              'D_senses_deep': 'Senses\n(pred. > 0)',
+                              'D_meanings_vs_frequency': 'Meanings −\nfrequency\n(pred. > 0)',
+                              'D_senses_vs_frequency': 'Senses −\nfrequency\n(pred. > 0)'}[h], loc='left')
+            axes[0][0].set_yticklabels(models)
+            axes[0][len(dh) // 2].set_xlabel('Slope of the oriented standardised effect per unit of normalised depth'
+                                             + (f' (×10$^{{{k}}}$)' if k else ''))
+            fig.legend(handles=handles, loc='outside lower center', ncol=3)
+            made.append(_save(fig, plt, dirs, 'fig3_depth_hypothesis_tests',
+                              'Direct test of the depth hypothesis (Stage 2, prespecified, confirmatory): least-squares '
+                              'slope of the oriented standardised effect on normalised depth, per model, with 95% '
+                              'bootstrap CIs over words; slope differences test whether the ambiguity effects rise with '
+                              'depth relative to frequency. Filled = supported, triangle = contradicted (Holm within '
+                              'the depth family); open = inconclusive. ' + common, test))
+        sh = ['S1B_separation', 'S1C_separation', 'S2_separation']
+        s = conf[conf['hypothesis'].isin(sh) & conf['summary'].isin(['deep', 'output'])]
+        if len(s):
+            fig, axes = plt.subplots(1, 3, figsize=(FIG_W, 0.24 * len(models) + 1.3), sharey=True,
+                                     squeeze=False, layout='constrained')
+            summ_col = {'deep': VIZ['text'], 'output': VIZ['summary_output']}
+            k = _axis_power(s)
+            for ax, h, title in zip(axes[0], sh, ('Stage 1, Exp. 2\n(visual)', 'Stage 1, Exp. 3\n(auditory; text input)',
+                                                  'Stage 2\n(computed proxies)')):
+                for summ, off in (('deep', -0.17), ('output', 0.17)):
+                    _forest(ax, s[(s['hypothesis'] == h) & (s['summary'] == summ)], models, summ_col[summ], off, k)
+                ax.set_title(title, loc='left')
+            axes[0][0].set_yticklabels(models)
+            axes[0][1].set_xlabel('β(meanings) − β(senses), standardised (predicted > 0)'
+                                  + (f' (×10$^{{{k}}}$)' if k else ''))
+            fig.legend(handles=handles + [Line2D([], [], color=summ_col['deep'], label='deep-region mean'),
+                                          Line2D([], [], color=summ_col['output'], label='output layer')],
+                       loc='outside lower center', ncol=5)
+            made.append(_save(fig, plt, dirs, 'fig4_meanings_vs_senses_separation',
+                              'Do meanings and senses separate? Difference between the standardised meanings and senses '
+                              'effects (β_meanings − β_senses; positive under the human pattern of inhibitory meanings '
+                              'and facilitatory senses), at the deep-region mean and the output layer, with 95% '
+                              'bootstrap CIs; filled = supported, triangle = contradicted (Holm); open = '
+                              'inconclusive. ' + common, test))
+    prim = sorted([x for x in sets if x.condition == pc and _lens_available(x)], key=lambda x: x.alias)
     if prim and cfg.run_stage2:
         rows = samples.stage2[cfg.gcide_zero_policy]
         q = rows['log_subtlex'].quantile([1 / 3, 2 / 3]).values
         tert = pd.cut(rows['log_subtlex'], [-np.inf, q[0], q[1], np.inf], labels=['low', 'mid', 'high'])
-        fig, axes = _grid(plt, len(prim))
-        for ax, ss in zip(axes, prim):
+        ncols = min(3, len(prim))
+        nrows = int(math.ceil(len(prim) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(FIG_W, 1.6 * nrows + 0.5), squeeze=False,
+                                 layout='constrained')
+        for ax in axes.flat[len(prim):]:
+            ax.set_visible(False)
+        for k, (ax, ss) in enumerate(zip(axes.flat, _model_order([x.alias for x in prim]))):
+            ss = next(x for x in prim if x.alias == ss)
             W = ss.word_matrix(pa)
             for i, lev in enumerate(['low', 'mid', 'high']):
                 w = [x for x in rows.loc[tert == lev, 'word'] if x in W.index]
                 if len(w) >= 3:
                     M = W.loc[w].values
                     mu, se = M.mean(0), M.std(0, ddof=1) / np.sqrt(len(w))
-                    _line(ax, ss.depth, mu, mu - 1.96 * se, mu + 1.96 * se, VIZ['ramp'][i], lev)
-            _guides(ax, zero=False)
-            ax.set_title(ss.alias)
-            ax.set_xlabel('normalised depth')
-            ax.set_ylabel('mean surprisal (bits)')
-        p = os.path.join(dirs['figures'], 'layerwise_surprisal_profiles.png')
-        _finish(fig, plt, p, 'Layerwise target surprisal by frequency tertile (Stage 2 pool)',
-                sub + '; bands = mean ± 1.96 SE over words',
-                [Line2D([], [], color=VIZ['ramp'][i], label=f'{lev} frequency tertile')
-                 for i, lev in enumerate(['low', 'mid', 'high'])])
-        made.append(p)
-    if models:
-        for fname, title, terms, oriented in (
-                ('meanings_vs_senses_profiles.png', 'Meanings vs senses proxies: Stage 2 coefficients',
-                 ['gcide_etymologies', 'wn_n_all'], False),
-                ('frequency_vs_ambiguity_depth.png', 'Depth hypothesis: oriented effects (positive = predicted '
-                 'direction)', ['log_subtlex', 'gcide_etymologies', 'wn_n_all'], True)):
-            fig, axes = _grid(plt, len(models))
-            for ax, m in zip(axes, models):
-                g = s2p[s2p['model'] == m]
-                for t in terms:
-                    gt = g[g['term'] == t].sort_values('depth')
-                    sgn = ORIENT[t] if oriented else 1
-                    lo, hi = sgn * gt['boot_ci_std_low'].values, sgn * gt['boot_ci_std_high'].values
-                    _line(ax, gt['depth'].values, sgn * gt['beta_std'].values, np.minimum(lo, hi), np.maximum(lo, hi),
-                          TERM_STYLE[t][1], TERM_STYLE[t][0])
-                _guides(ax)
-                ax.set_title(m)
-                ax.set_xlabel('normalised depth')
-                ax.set_ylabel('oriented standardised β' if oriented else 'standardised β')
-            p = os.path.join(dirs['figures'], fname)
-            _finish(fig, plt, p, title, sub + f'; Stage 2 primary spec, zero policy={cfg.gcide_zero_policy}; bands = '
-                    '95% bootstrap CI over words', [Line2D([], [], color=TERM_STYLE[t][1], label=TERM_STYLE[t][0])
-                                                   for t in terms])
-            made.append(p)
-        cmap = LinearSegmentedColormap.from_list('div', ['#1c5cab', '#f0efec', '#c23434'])
+                    ax.fill_between(ss.depth, mu - 1.96 * se, mu + 1.96 * se, color=VIZ['ramp'][i], alpha=0.2,
+                                    linewidth=0)
+                    ax.plot(ss.depth, mu, color=VIZ['ramp'][i], label=f'{lev} frequency')
+            _depth_axes(ax, 'Surprisal (bits)' if k % ncols == 0 else '', zero=False)
+            ax.set_title(ss.alias, loc='left')
+        fig.legend(handles=[Line2D([], [], color=VIZ['ramp'][i], label=f'{lev} frequency')
+                            for i, lev in enumerate(['low', 'mid', 'high'])], loc='outside lower center', ncol=3)
+        made.append(_save(fig, plt, dirs, 'figS1_surprisal_by_frequency_tertile',
+                          'Supplementary: mean target surprisal across depth for low, mid and high log-frequency '
+                          'tertiles of the Stage 2 pool (bands = mean ± 1.96 SE over words). ' + common, test))
+    if len(s2) and s2['model'].nunique() >= 2:
+        models = _model_order(s2['model'])
         terms = ['log_subtlex', 'gcide_etymologies', 'wn_n_all']
         grid = np.linspace(0.05, 1.0, 20)
-        mats = [np.array([np.interp(grid, *s2p[(s2p['model'] == m) & (s2p['term'] == t)].sort_values('depth')[
+        mats = [np.array([np.interp(grid, *s2[(s2['model'] == m) & (s2['term'] == t)].sort_values('depth')[
             ['depth', 'beta_std']].values.T, left=np.nan) for m in models]) for t in terms]
         vmax = float(np.nanmax([np.nanmax(np.abs(M)) for M in mats])) or 1.0
-        fig, axes = plt.subplots(1, 4, figsize=(12, 0.45 * len(models) + 2.6), squeeze=False,
-                                 gridspec_kw={'width_ratios': [1, 1, 1, 0.05]})
+        fig, axes = plt.subplots(1, 4, figsize=(FIG_W, 0.18 * len(models) + 1.3), squeeze=False,
+                                 gridspec_kw={'width_ratios': [1, 1, 1, 0.05]}, layout='constrained')
+        cmap = LinearSegmentedColormap.from_list('div', ['#1c5cab', '#f0efec', '#c23434'])
         for ax, t, M in zip(axes[0][:3], terms, mats):
             im = ax.imshow(M, aspect='auto', cmap=cmap, vmin=-vmax, vmax=vmax, extent=(grid[0], 1.0, len(models), 0))
             ax.set_yticks(np.arange(len(models)) + 0.5)
             ax.set_yticklabels(models if t == terms[0] else [''] * len(models))
-            ax.set_title(TERM_STYLE[t][0])
-            ax.set_xlabel('normalised depth')
+            ax.set_title({'log_subtlex': 'Frequency', 'gcide_etymologies': 'Meanings proxy',
+                          'wn_n_all': 'Senses proxy'}[t], loc='left')
+            ax.set_xlabel('Normalised depth')
             ax.set_xlim(0, 1)
-        fig.colorbar(im, cax=axes[0][3], label='standardised β (blue < 0 < red)')
-        p = os.path.join(dirs['figures'], 'stage2_generalisation.png')
-        _finish(fig, plt, p, 'Stage 2 generalisation (derived pool, proxies): coefficients across models',
-                sub + '; linear interpolation to a common depth grid; blank = depth not covered by that model; models '
-                'share the items and are not independent samples')
-        made.append(p)
-    s1 = pd.concat([T.get('stage1_published_appendix_B', pd.DataFrame()),
-                    T.get('stage1_published_appendix_C', pd.DataFrame())], ignore_index=True)
-    if len(s1):
-        s1 = s1[(s1['condition'] == pc) & (s1['aggregate'] == pa) & (s1['spec'] == 'factorial')]
-    if len(s1):
-        ms = sorted(s1['model'].unique())
-        fig, axes = plt.subplots(2, len(ms), figsize=(max(7.0, 3.3 * len(ms)), 6.0), squeeze=False)
-        for j, m in enumerate(ms):
-            for i, app in enumerate(['stage1_B', 'stage1_C']):
-                ax = axes[i][j]
-                ax.spines[['top', 'right']].set_visible(False)
-                ax.grid(axis='y', color=VIZ['grid'], linewidth=0.6)
-                g = s1[(s1['model'] == m) & (s1['analysis'] == app)]
-                for t in ('ambiguity', 'senses'):
-                    gt = g[g['term'] == t].sort_values('depth')
-                    _line(ax, gt['depth'].values, gt['beta_std'].values, gt['boot_ci_std_low'].values,
-                          gt['boot_ci_std_high'].values, TERM_STYLE[t][1], TERM_STYLE[t][0])
-                _guides(ax)
-                ax.set_xlim(0, 1)
-                ax.set_title(f"{m}\nAppendix {app[-1]} · " + ('Exp. 2, visual' if app.endswith('B') else
-                                                             'Exp. 3, auditory (text input)'), fontsize=8)
-                ax.set_xlabel('normalised depth')
-                ax.set_ylabel('effect (SD of surprisal)')
-        p = os.path.join(dirs['figures'], 'stage1_factorial_effects.png')
-        _finish(fig, plt, p, 'Stage 1: meanings and senses in the published 2×2 designs',
-                sub + '; human pattern (sign comparison only): senses negative, ambiguity null (B) / positive (C)',
-                [Line2D([], [], color=TERM_STYLE[t][1], label=TERM_STYLE[t][0] + (' (ambiguous − unambiguous)' if t ==
-                 'ambiguity' else ' (many − few)')) for t in ('ambiguity', 'senses')])
-        made.append(p)
+            ax.set_xticks([0, 1 / 3, 2 / 3, 1])
+            ax.set_xticklabels(['0', '⅓', '⅔', '1'])
+        fig.colorbar(im, cax=axes[0][3], label='Standardised β')
+        made.append(_save(fig, plt, dirs, 'figS2_stage2_coefficients_heatmap',
+                          'Supplementary: Stage 2 standardised coefficients for every model on a common normalised-depth '
+                          'grid (linear interpolation; blank = depth not covered). ' + common, test))
     pid = T.get('prompt_interaction_depth_tests', pd.DataFrame())
-    if len(pid):
-        g0 = pid[(pid['statistic'] == 'Δ oriented effect at layer') & (pid['analysis'] == 'stage2')]
-        panels = sorted({(m, c) for m, c in zip(g0['model'], g0['condition'])})
-        if panels:
-            fig, axes = _grid(plt, len(panels))
-            for ax, (m, c) in zip(axes, panels):
-                g = g0[(g0['model'] == m) & (g0['condition'] == c)]
-                for t in ('log_subtlex', 'gcide_etymologies', 'wn_n_all'):
-                    gt = g[g['term'] == t].sort_values('depth')
-                    _line(ax, gt['depth'].values, gt['estimate'].values, gt['boot_ci_low'].values,
-                          gt['boot_ci_high'].values, TERM_STYLE[t][1], TERM_STYLE[t][0])
-                _guides(ax)
-                ax.set_title(f'{m}\n{c} vs {pc}', fontsize=8)
-                ax.set_xlabel('normalised depth')
-                ax.set_ylabel('Δ oriented standardised β')
-            p = os.path.join(dirs['figures'], 'prompt_layer_interactions.png')
-            _finish(fig, plt, p, 'Layer × task instruction: change of oriented effects under another task frame',
-                    f'Δ = oriented β(condition) − oriented β({pc}), Stage 2 primary spec, paired bootstrap over words, '
-                    f'aggregate={pa}{test_note}', [Line2D([], [], color=TERM_STYLE[t][1], label=TERM_STYLE[t][0])
-                                                  for t in ('log_subtlex', 'gcide_etymologies', 'wn_n_all')])
-            made.append(p)
+    g0 = pid[(pid['statistic'] == 'Δ oriented effect at layer') & (pid['analysis'] == 'stage2')] if len(pid) else pid
+    if len(g0):
+        panels = [(m, c) for m in _model_order(g0['model']) for c in sorted(g0.loc[g0['model'] == m, 'condition'].unique())]
+        ncols = min(3, len(panels))
+        nrows = int(math.ceil(len(panels) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(FIG_W, 1.8 * nrows + 0.6), squeeze=False,
+                                 layout='constrained')
+        for ax in axes.flat[len(panels):]:
+            ax.set_visible(False)
+        for k, (ax, (m, c)) in enumerate(zip(axes.flat, panels)):
+            g = g0[(g0['model'] == m) & (g0['condition'] == c)]
+            for t in ('log_subtlex', 'gcide_etymologies', 'wn_n_all'):
+                gt = g[g['term'] == t].sort_values('depth')
+                ax.fill_between(gt['depth'], gt['boot_ci_low'], gt['boot_ci_high'], color=TERM_STYLE[t][1],
+                                alpha=0.15, linewidth=0)
+                ax.plot(gt['depth'], gt['estimate'], color=TERM_STYLE[t][1], label=TERM_STYLE[t][0])
+            _depth_axes(ax, 'Δ oriented effect (SD)' if k % ncols == 0 else '')
+            ax.set_title(f'{m}\n{c}', loc='left')
+        fig.legend(handles=[Line2D([], [], color=TERM_STYLE[t][1], label=TERM_STYLE[t][0])
+                            for t in ('log_subtlex', 'gcide_etymologies', 'wn_n_all')], loc='outside lower center',
+                   ncol=3)
+        made.append(_save(fig, plt, dirs, 'figS3_task_instruction_by_depth',
+                          f'Supplementary (exploratory): change of the oriented Stage 2 effects when the lexical-decision '
+                          f'frame ("{pc}") is replaced by another task instruction, paired by word (95% paired bootstrap '
+                          'bands). ' + common, test))
+    return made
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# PUBLICATION TABLES — LaTeX (booktabs, table*: valid in ACL two-column layout)
+# ════════════════════════════════════════════════════════════════════════════
+_TEX_UNICODE = {'−': '$-$', 'β': r'$\beta$', '±': r'$\pm$', '×': r'$\times$', 'Δ': r'$\Delta$', '≥': r'$\geq$',
+                '≤': r'$\leq$', '≈': r'$\approx$', '–': '--', '—': '---', '·': r'$\cdot$', '⅓': '1/3', '⅔': '2/3',
+                '→': r'$\rightarrow$', '>': '$>$', '<': '$<$'}          # < > are ¡ ¿ in OT1 text mode
+
+
+def _tex(s) -> str:
+    s = str(s).replace('\\', '\x00')
+    for a, b in (('&', r'\&'), ('%', r'\%'), ('_', r'\_'), ('#', r'\#'), ('{', r'\{'), ('}', r'\}'),
+                 ('~', r'\textasciitilde{}'), ('^', r'\textasciicircum{}'), ('$', r'\$')):
+        s = s.replace(a, b)
+    for a, b in _TEX_UNICODE.items():
+        s = s.replace(a, b)
+    return s.replace('\x00', r'\textbackslash{}')
+
+
+def _num(x, d=2) -> str:
+    return '--' if not np.isfinite(x) else f'${x:.{d}f}$'
+
+
+def _est_ci(r, d=2, stacked: bool = False) -> str:
+    """estimate [95% CI] with the evidence mark; stacked = CI on a second line (narrow columns)."""
+    mark = '$^{*}$' if str(r['evidence']).startswith('supported') else \
+        ('$^{\\dagger}$' if str(r['evidence']).startswith('contradicted') else '')
+    ci = f"[{_num(r['ci95_low'], d)}, {_num(r['ci95_high'], d)}]"
+    if stacked:
+        return (f"\\begin{{tabular}}[t]{{@{{}}c@{{}}}}{_num(r['estimate'], d)}{mark}"
+                f"\\\\ {{\\scriptsize {ci}}}\\end{{tabular}}")
+    return f"{_num(r['estimate'], d)} {ci}{mark}"
+
+
+def latex_table(header: list, rows: list, caption: str, label: str, colspec: str, notes: str = '',
+                groups: list = None, size: str = r'\small') -> str:
+    """booktabs table* (full text width; longtable is not allowed in two-column mode). `groups` =
+    [(label, n_columns), ...] adds a spanning header row with cmidrule rules above the column header."""
+    head = ' & '.join(header) + r' \\'
+    if groups:
+        spans, rules, c = [], [], 1
+        for g, k in groups:
+            spans.append(f'\\multicolumn{{{k}}}{{c}}{{{g}}}' if g else '&' * (k - 1))
+            if g:
+                rules.append(f'\\cmidrule(lr){{{c}-{c + k - 1}}}')
+            c += k
+        head = ' & '.join(spans) + r' \\ ' + ''.join(rules) + '\n' + head
+    out = [r'\begin{table*}[t]', r'\centering', size, f'\\begin{{tabular}}{{{colspec}}}', r'\toprule', head,
+           r'\midrule'] + [' & '.join(r) + r' \\' for r in rows] + [r'\bottomrule', r'\end{tabular}']
+    if notes:
+        out.append(r'\par\smallskip\parbox{\linewidth}{\footnotesize ' + notes + '}')
+    return '\n'.join(out + [f'\\caption{{{caption}}}', f'\\label{{{label}}}', r'\end{table*}'])  # ACL: caption below
+
+
+def write_latex(path: str, tables: list):
+    atomic_write_text(path, f"% Generated by {SCRIPT_NAME} v{SCRIPT_VERSION}; requires \\usepackage{{booktabs}}\n"
+                      + '\n\n'.join(tables) + '\n')
+
+
+def make_publication_tables(cfg, T: dict, samples: Samples, dirs: dict, test: bool) -> list:
+    pdir = os.path.join(dirs['tables'], 'latex')
+    os.makedirs(pdir, exist_ok=True)
+    warn = r' \textbf{TEST MODELS WITH RANDOM WEIGHTS: NOT RESULTS.}' if test else ''
+    made = []
+    rows = []
+    rr = lambda x: r'\raggedright ' + _tex(x)       # p{} cells; never the last column, so the row's \\ is intact
+    for app in 'ABC':
+        r = samples.stage1[samples.stage1['appendix'] == app]
+        e, m = APPENDIX_DESIGN[app]
+        if app == 'A':
+            cells = ', '.join(f'{k} {v}' for k, v in r['ambiguity'].value_counts().items())
+            design, n = 'regression: meanings + WordNet senses + controls', design_stage1_A(samples.stage1).n
+        else:
+            sizes = r.groupby(['ambiguity', 'senses']).size()
+            cells = f'{sizes.iloc[0]} per cell' if sizes.nunique() == 1 else ', '.join(map(str, sizes.values))
+            design, n = '2 × 2 meanings × senses', design_stage1_BC(samples.stage1, app).n
+        rows.append(['Stage 1', f'Rodd2002-{app}', str(e), rr(m + (' (text input)' if m == 'auditory' else '')),
+                     rr(design), rr(cells), str(n)])
+    rows.append(['Stage 2', 'WordNet 3.0', '--', rr('--'), rr('regression on proxies'),
+                 rr(f'{len(samples.stage2_base)} in range; zero policy {cfg.gcide_zero_policy}'),
+                 str(design_stage2(samples.stage2[cfg.gcide_zero_policy], 'primary', cfg.gcide_zero_policy).n)])
+    p = os.path.join(pdir, 'table1_design_and_samples.tex')
+    write_latex(p, [latex_table(['Stage', 'Item set', 'Exp.', 'Modality', 'Design', 'Cells', '$n$'], rows,
+                                'Item sets, designs and sample sizes; $n$ = complete cases analysed (recomputed from '
+                                'the stimulus CSV).', 'tab:design', 'llcp{2.1cm}p{3.6cm}p{2.9cm}r',
+                                notes='Stage 1 items are the published Rodd, Gaskell \\& Marslen-Wilson (2002) '
+                                      'stimuli; Stage 2 items are WordNet-derived candidates never used in a human '
+                                      'experiment.')])
+    made.append(p)
+    conf = T.get('confirmatory_hypothesis_tests', pd.DataFrame())
+    if not len(conf):
+        return made
+    models = _model_order(conf['model'])
+    hyps = [h[0] for h in HYPOTHESES if h[0] in set(conf['hypothesis'])]
+    source = {x[0]: x[6] for x in HYPOTHESES}
+    family = {x[0]: x[5] for x in HYPOTHESES}
+    fam_label = {'stage1_calibration': ('Stage 1', 'Stage 1 calibration'),      # (column group, legend)
+                 'stage2_generalisation': ('Stage 2', 'Stage 2 generalisation'),
+                 'depth_hypothesis': ('Depth', 'Depth hypothesis')}
+    fams = [f for f in fam_label if any(family[h] == f for h in hyps)]
+    hyps = [h for f in fams for h in hyps if family[h] == f]
+    col = {h: HYP_SHORT[h] if family[h] == 'stage1_calibration' else HYP_SHORT[h].split('-', 1)[1] for h in hyps}
+    rows = []
+    for m in models:
+        g = conf[conf['model'] == m].set_index(['hypothesis', 'summary'])
+        cells = []
+        for h in hyps:
+            key = (h, 'all blocks (slope per unit depth)') if h.startswith('D_') else (h, 'output')
+            cells.append(_tex(EVIDENCE_MARK.get(g.loc[key, 'evidence'], '?')) if key in g.index else '--')
+        rows.append([_tex(m)] + cells)
+    p = os.path.join(pdir, 'table2_confirmatory_evidence_matrix.tex')
+    legend = ' '.join(f"{fam_label[f][1]}: " + '; '.join(
+        (col[h] if col[h] == HYP_SHORT[h] else f'{col[h]} ({HYP_SHORT[h]})') + f' = {source[h]}'
+        for h in hyps if family[h] == f) + '.' for f in fams)
+    write_latex(p, [latex_table(['Model'] + [_tex(col[h]) for h in hyps], rows,
+                                'Prespecified confirmatory hypotheses per model (primary condition and aggregate): '
+                                'S = supported, C = contradicted, E = equivalent to zero within the smallest effect of '
+                                'interest, $\\cdot$ = inconclusive; Holm-adjusted within family. Effects are read at '
+                                'the output layer, depth hypotheses as slopes over all blocks.' + warn, 'tab:evidence',
+                                'l' + 'c' * len(hyps), notes=_tex(legend),
+                                groups=[('', 1)] + [(fam_label[f][0], sum(family[h] == f for h in hyps)) for f in fams],
+                                size=r'\footnotesize\setlength{\tabcolsep}{3pt}')])
+    made.append(p)
+    for name, hset, title, label in (
+            ('table3_stage2_effects', ['S2_frequency', 'S2_meanings', 'S2_senses', 'S2_separation'],
+             'Stage 2 (generalisation on computed proxies): standardised effects at the output layer', 'tab:stage2'),
+            ('table4_depth_slopes', [h for h in hyps if h.startswith('D_')],
+             'Depth hypothesis: slopes of oriented standardised effects on normalised depth', 'tab:depth')):
+        hs = [h for h in hset if h in hyps]
+        if not hs:
+            continue
+        rows = []
+        for m in models:
+            g = conf[conf['model'] == m]
+            row = [_tex(m)]
+            for h in hs:
+                r = g[(g['hypothesis'] == h) & (g['summary'].isin(['output', 'all blocks (slope per unit depth)']))]
+                row.append(_est_ci(r.iloc[0], 3 if name == 'table4_depth_slopes' else 2, stacked=True)
+                           if len(r) else '--')
+            rows.append(row)
+        p = os.path.join(pdir, f'{name}.tex')
+        write_latex(p, [latex_table(['Model'] + [_tex(HYP_SHORT[h]) for h in hs], rows,
+                                    f'{title}, estimate [95\\% bootstrap CI]; $^{{*}}$ supported, $^{{\\dagger}}$ '
+                                    f'contradicted (Holm within family).' + warn, label, 'l' + 'c' * len(hs),
+                                    notes=_tex('; '.join(f'{HYP_SHORT[h]} = {source[h]}' for h in hs)))])
+        made.append(p)
+    tabs = []
+    for m in models:
+        g = conf[conf['model'] == m]
+        g = g.iloc[np.lexsort((g['summary'].map({k: i for i, k in enumerate(('shallow', 'middle', 'deep', 'output'))})
+                               .fillna(4).values, g['hypothesis'].map({h: i for i, h in enumerate(hyps)}).values))]
+        rows = [[_tex(HYP_SHORT[r['hypothesis']]), _tex(r['summary'].replace('all blocks (slope per unit depth)',
+                                                                               'slope over all blocks')),
+                 _est_ci(r, 3), _num(r['p_holm'], 3), _tex(EVIDENCE_MARK.get(r['evidence'], '?'))]
+                for _, r in g.iterrows()]
+        tabs.append(latex_table(['Hyp.', 'Summary', 'Estimate [95\\% CI]', '$p_\\mathrm{Holm}$', 'Evidence'], rows,
+                                f'All prespecified confirmatory tests for {_tex(m)} (primary condition and aggregate); '
+                                'codes and evidence marks as in the evidence-matrix table.' + warn,
+                                f'tab:confirmatory-{m}', 'llccc', size=r'\footnotesize'))
+    p = os.path.join(pdir, 'tableS1_confirmatory_tests_by_model.tex')
+    write_latex(p, tabs)
+    made.append(p)
     return made
 
 
@@ -3835,6 +4138,20 @@ def write_report(cfg, dirs, audit, env, conds, model_status, model_errors, res, 
     for m, g in (conf.groupby('model') if len(conf) else []):
         L.append(f"\n### {m}\n")
         L.append(_md_table(_evidence_matrix(g), max_rows=40))
+    if len(conf):
+        L.append("\n**Sensitivity — what these item sets can detect.** `mde80` = smallest true standardised effect "
+                 "that the unadjusted two-sided test detects with 80% power at the observed bootstrap SE (the "
+                 "Holm-adjusted tests need more); median over models, output layer or depth slope.\n")
+        key = conf[conf['summary'].isin(['output', 'all blocks (slope per unit depth)'])]
+        L.append(_md_table(key.groupby('hypothesis', sort=False).agg(
+            n=('n', 'first'), median_boot_se=('boot_se', 'median'), median_mde80=('mde80', 'median')).reset_index()))
+        eq = conf[conf['kind'] == 'equivalence']
+        if len(eq) and not eq['equivalence_attainable'].astype(bool).any():
+            L.append(f"\n**Equivalence is not attainable** for {', '.join(sorted(set(eq['hypothesis'])))} at "
+                     f"n = {int(eq['n'].max())} with SESOI = ±{cfg.sesoi_std} SD in any model or summary: "
+                     "z(1−α)·SE ≥ SESOI even for an estimate of exactly 0, so this hypothesis can only be "
+                     "'inconclusive' or 'contradicted'. This is a property of the published item set (its size), "
+                     "not of the models; a null meanings effect cannot be confirmed with it.\n")
     pat = T.get('meanings_vs_senses_pattern', pd.DataFrame())
     L.append("\n## 8. Do meanings and senses separate, or is there one predictability effect?\n")
     L.append(_md_table(pat[pat['role'] == 'confirmatory'] if len(pat) else pat,
@@ -3889,8 +4206,14 @@ def write_report(cfg, dirs, audit, env, conds, model_status, model_errors, res, 
             'Inflected forms and emotional extremes were not screened unless a resource was supplied.'):
         L.append(f"- {lim}\n")
     L.append("\n## 14. Files\n")
+    L.append("Figures are drawn at the ACL text width (16 cm) with 7–8 pt embedded TrueType text: include them with "
+             "`\\includegraphics[width=\\textwidth]{…}` inside `figure*`, unscaled. Tables are `table*` floats "
+             "(`\\usepackage{booktabs}`), checked to compile within the 16 cm text width; `\\input{…}` them.\n\n")
     for fpath in res.get('figures', []):
-        L.append(f"- figure: `{os.path.relpath(fpath, dirs['root'])}`\n")
+        L.append(f"- figure (vector PDF; 300-dpi PNG and `_caption.txt` alongside): "
+                 f"`{os.path.relpath(fpath, dirs['root'])}`\n")
+    for fpath in res.get('latex_tables', []):
+        L.append(f"- LaTeX table (booktabs): `{os.path.relpath(fpath, dirs['root'])}`\n")
     L.append("- tables: `tables/` (confirmatory_hypothesis_tests, meanings_vs_senses_pattern, stage1_*, stage2_*, "
              "exclusions, construct_registry, analysis_registry, multiple_testing, …)\n")
     atomic_write_text(os.path.join(dirs['root'], 'REPORT.md'), _md_spacing(''.join(L)))
@@ -4691,7 +5014,12 @@ def run_self_tests(verbose: bool = True) -> bool:
             self.assertTrue({'experiment', 'modality'} <= set(T['stage1_published_appendix_C'].columns))
             conf = T['confirmatory_hypothesis_tests']
             self.assertTrue(len(conf) and (conf['role'] == 'confirmatory').all())
-            self.assertTrue({'p_holm', 'evidence', 'ci95_low', 'summary'} <= set(conf.columns))
+            self.assertTrue({'p_holm', 'evidence', 'ci95_low', 'summary', 'mde80'} <= set(conf.columns))
+            eq = conf[conf['kind'] == 'equivalence']
+            self.assertTrue(conf.loc[conf['kind'] != 'equivalence', 'equivalence_attainable'].isna().all())
+            # bootstrap SE of the 60-item subset is far above SESOI/z: TOST can never succeed, and must say so
+            self.assertTrue(len(eq) and not eq['equivalence_attainable'].astype(bool).any())
+            self.assertIn('Equivalence is not attainable', report)
             self.assertTrue(set(conf['evidence']) <= {'supported', 'contradicted', 'inconclusive',
                                                       'supported (equivalent to zero within ±SESOI)',
                                                       'contradicted (non-zero effect)'})
@@ -4706,6 +5034,58 @@ def run_self_tests(verbose: bool = True) -> bool:
             self.assertTrue((hp['role'] == 'exploratory (annotations not validated)').all())
             # the fixture reuses the same three templates for every word: the code must refuse to interpret it
             self.assertTrue(hp.loc[hp['evidence'] != 'descriptive', 'evidence'].str.startswith('not interpretable').all())
+            # publication figures: exact ACL text width, embedded TrueType text, PNG + caption sidecars
+            figs = {os.path.basename(f) for f in res['figures']}
+            for name in ('fig1_stage1_meanings_senses_by_depth', 'fig2_stage2_frequency_meanings_senses_by_depth',
+                         'fig3_depth_hypothesis_tests', 'fig4_meanings_vs_senses_separation'):
+                self.assertIn(name + '.pdf', figs)
+                base = os.path.join(c['dirs']['figures'], name)
+                self.assertTrue(os.path.exists(base + '.png'), name)
+                self.assertIn('NOT RESULTS', open(base + '_caption.txt', encoding='utf-8').read())
+                pdf = open(base + '.pdf', 'rb').read()
+                self.assertIn(b'/FontFile2', pdf)
+                self.assertNotIn(b'/Type3', pdf)
+                box = re.search(rb'/MediaBox \[ 0 0 ([\d.]+) ([\d.]+) \]', pdf)
+                self.assertAlmostEqual(float(box.group(1)) / 72, FIG_W, places=3)
+            # LaTeX tables: balanced environments; every body row has as many cells as the column spec
+            self.assertEqual({os.path.basename(f) for f in res['latex_tables']},
+                             {'table1_design_and_samples.tex', 'table2_confirmatory_evidence_matrix.tex',
+                              'table3_stage2_effects.tex', 'table4_depth_slopes.tex',
+                              'tableS1_confirmatory_tests_by_model.tex'})
+            for f in res['latex_tables']:
+                tex = open(f, encoding='utf-8').read()
+                self.assertEqual(tex.count(r'\begin{table*}'), tex.count(r'\end{table*}'))
+                self.assertEqual(tex.count('{'), tex.count('}'), f)
+                for spec, body in re.findall(r'\\begin\{tabular\}\{([^}]*(?:\{[^}]*\}[^}]*)*)\}\n(.*?)\\end\{tabular\}\n',
+                                             tex, re.S):
+                    ncol = len(re.findall(r'[lcr]', re.sub(r'p\{[^}]*\}', 'l', spec)))
+                    rows = body.split(r'\midrule')[-1].split(r'\bottomrule')[0].strip().split(' \\\\\n')
+                    for row in rows:
+                        self.assertEqual(len(re.findall(r'(?<!\\)&', row)), ncol - 1, (os.path.basename(f), row))
+                    self.assertNotIn('>', re.sub(r'\$[^$]*\$', '', body))
+            shared.update(latex_tables=res['latex_tables'], figures=res['figures'])
+
+        def test_18b_publication_outputs_compile(self):
+            if 'latex_tables' not in shared:
+                self.skipTest('depends on test_18')
+            import subprocess
+            exe = shutil.which('pdflatex')
+            if exe is None:
+                self.skipTest('pdflatex not installed (LaTeX compile check)')
+            d = tempfile.mkdtemp(dir=tmp_root)
+            body = [f'\\input{{{f}}}' for f in shared['latex_tables']] + [
+                f'\\begin{{figure*}}[t]\\includegraphics[width=\\textwidth]{{{f}}}\\caption{{x}}\\end{{figure*}}'
+                for f in shared['figures']]
+            with open(os.path.join(d, 'doc.tex'), 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join([r'\documentclass[11pt,twocolumn]{article}',
+                                    r'\usepackage[a4paper,textwidth=16cm,textheight=24.7cm,columnsep=0.6cm]{geometry}',
+                                    r'\usepackage[T1]{fontenc}', r'\usepackage{booktabs}', r'\usepackage{graphicx}',
+                                    r'\begin{document}'] + body + ['Text.', r'\end{document}']))
+            run = subprocess.run([exe, '-interaction=nonstopmode', '-halt-on-error', 'doc.tex'], cwd=d,
+                                 capture_output=True, text=True, timeout=300)
+            log = open(os.path.join(d, 'doc.log'), encoding='latin-1').read()
+            self.assertEqual(run.returncode, 0, log[-3000:])
+            self.assertNotIn('Overfull \\hbox', log)            # ACL text width (16 cm) is respected
 
         # ── statistics ─────────────────────────────────────────────────────
         def test_19_regression_uncertainty_and_multiplicity(self):
