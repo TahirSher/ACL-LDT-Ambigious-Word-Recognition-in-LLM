@@ -64,6 +64,11 @@ DESIGN DECISIONS THAT GO BEYOND THE SPEC (each is a control, not a new task)
   * Tokenisation-stratified test scores (single- vs multi-token words), because
     multi-token words are assembled into word representations in early/middle
     layers (Kaplan et al., 2024; Feucht et al., 2024).
+  * Optional untrained control (--random-init-control; Hewitt & Liang, 2019):
+    the same architecture and tokenizer with random weights. Sub-token identity
+    alone (e.g. "-er" derivations, which lack GCIDE etymologies) can make
+    properties partly recoverable; trained-minus-random contrasts isolate what
+    pre-training adds. Strongly recommended for at least one model per family.
   * Exploratory (clearly labelled) ambiguity contrast on the 309 human-normed
     Rodd et al. (2002) items: multiple-meanings and many-senses decoding with
     repeated nested CV, raw and with frequency/length/token-count linearly
@@ -82,9 +87,13 @@ ESTIMATION
 STATISTICS
   95% percentile CIs from a paired bootstrap over test words (B = 2000); the
   SAME resample indices are used for every model, layer and condition with the
-  same test set, so differences are paired. Above-chance tests per layer: test-
-  label permutation with the trained probe fixed (P = 2000), Holm-corrected
-  across layers. Base-vs-instruct and within-model contrasts: two-sided paired
+  same test set, so differences are paired. Per-layer test of INFORMATION:
+  permutation of test targets with the trained probe fixed (P = 2000) using
+  Pearson r (regression) or AUROC (classification), Holm-corrected across
+  layers. With predictions fixed, permutation only changes sum(y * pred), so it
+  is a test of association and NOT of R^2 > 0; "better than the training mean /
+  chance" is read from the bootstrap CI. Figures mark a layer only when both
+  hold. Base-vs-instruct and within-model contrasts: two-sided paired
   bootstrap p, Holm-corrected across layers. Note: bootstrap over test words
   captures test-sampling variance only; use --split-seeds 0,1,2,3,4 to add
   split/training variability (reported as mean +/- sd across seeds).
@@ -217,6 +226,7 @@ class ModelConfig:
     base_of: str | None = None      # for instruct variants: name of the base counterpart
     chat: bool = False              # wrap every input in the tokenizer's chat template
     revision: str | None = None     # pin a hub commit for exact reproducibility
+    random_init: bool = False       # control: same architecture/tokenizer, untrained weights
 
     def __post_init__(self):
         if not self.family:
@@ -261,11 +271,13 @@ def group_models(models: list[ModelConfig]) -> dict[str, list[ModelConfig]]:
     if len(names) != len(set(names)):
         raise ValueError('model names must be unique')
     groups: dict[str, list[ModelConfig]] = {}
-    for m in sorted(models, key=lambda m: m.variant != 'base'):
+    order = {'base': 0, 'instruct': 1, 'random_init': 2}
+    for m in sorted(models, key=lambda m: order[m.variant]):
         groups.setdefault(m.pair, []).append(m)
     for g, ms in groups.items():
-        if sum(m.variant == 'base' for m in ms) > 1 or sum(m.variant == 'instruct' for m in ms) > 1:
-            raise ValueError(f"group {g!r} must contain at most one base and one instruct model")
+        for v in ('base', 'instruct', 'random_init'):
+            if sum(m.variant == v for m in ms) > 1:
+                raise ValueError(f"group {g!r} must contain at most one {v} model")
     return groups
 
 
@@ -544,9 +556,20 @@ class HiddenStateExtractor:
         self.pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
         self.tok = tok
         dkey = 'dtype' if _transformers_version() >= (4, 56, 0) else 'torch_dtype'
-        model = AutoModelForCausalLM.from_pretrained(
-            spec.model_id, revision=spec.revision, low_cpu_mem_usage=True,
-            trust_remote_code=cfg.trust_remote_code, **{dkey: dtype})
+        if spec.random_init:
+            # Untrained control (Hewitt & Liang, 2019): the architecture's own
+            # initialisation under a fixed seed; isolates what is recoverable
+            # from token identity + architecture alone.
+            from transformers import AutoConfig
+            torch.manual_seed(cfg.seed)
+            mcfg = AutoConfig.from_pretrained(spec.model_id, revision=spec.revision,
+                                              trust_remote_code=cfg.trust_remote_code)
+            model = AutoModelForCausalLM.from_config(mcfg, trust_remote_code=cfg.trust_remote_code,
+                                                     **{dkey: dtype})
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                spec.model_id, revision=spec.revision, low_cpu_mem_usage=True,
+                trust_remote_code=cfg.trust_remote_code, **{dkey: dtype})
         model.to(dev).eval()
         for p in model.parameters():
             p.requires_grad_(False)
@@ -556,7 +579,8 @@ class HiddenStateExtractor:
         self.info = {
             'model_id': spec.model_id, 'revision_requested': spec.revision,
             'commit_hash': getattr(model.config, '_commit_hash', None),
-            'variant': spec.variant, 'n_layers': self.n_layers, 'hidden_size': self.hidden,
+            'variant': spec.variant, 'random_init': spec.random_init, 'init_seed': cfg.seed if spec.random_init else None,
+            'n_layers': self.n_layers, 'hidden_size': self.hidden,
             'n_parameters': int(sum(p.numel() for p in model.parameters())),
             'dtype': str(dtype).replace('torch.', ''), 'device': dev,
             'tokenizer_class': type(tok).__name__, 'vocab_size': len(tok),
@@ -712,6 +736,7 @@ def extract_model(spec: ModelConfig, wt: pd.DataFrame, cfg: Config, out: Path) -
 
 def cache_key(spec: ModelConfig, frame: str, words: list, cfg: Config) -> str:
     return sha1_of({'model_id': spec.model_id, 'revision': spec.revision, 'variant': spec.variant,
+                    'random_init': spec.random_init, 'init_seed': cfg.seed if spec.random_init else None,
                     'frame_text': PROMPT_FRAMES[frame]['text'], 'words': sha1_of(words),
                     'system': cfg.instruct_system_message if spec.chat else None,
                     'date': cfg.chat_template_date if spec.chat else None,
@@ -882,12 +907,16 @@ def regression_metrics(y, pred, y_train_mean, boot, perm) -> dict:
     Yb, Pb = y[boot], pred[boot]
     sst_tm = lambda Y: ((Y - y_train_mean) ** 2).sum(-1)
     out = {
-        'r2': (_r2(y, pred), _r2(Yb, Pb), _r2(y[perm], pred[None, :])),
+        'r2': (_r2(y, pred), _r2(Yb, Pb), None),
         'r2_oos_vs_train_mean': (1 - ((y - pred) ** 2).sum() / sst_tm(y),
                                  1 - ((Yb - Pb) ** 2).sum(-1) / sst_tm(Yb), None),
         'mae': (np.abs(y - pred).mean(), np.abs(Yb - Pb).mean(-1), None),
         'rmse': (np.sqrt(((y - pred) ** 2).mean()), np.sqrt(((Yb - Pb) ** 2).mean(-1)), None),
-        'pearson_r': (_pearson(y, pred), _pearson(Yb, Pb), None),
+        # Permutation statistic. With the trained probe fixed, permuting test
+        # targets changes only the cross term sum(y * pred), so the exact test is
+        # one of ASSOCIATION (H0: predictions carry no information about targets),
+        # not of R^2 > 0; "beats the training mean" is judged by the R^2 CI.
+        'pearson_r': (_pearson(y, pred), _pearson(Yb, Pb), _pearson(y[perm], pred[None, :])),
     }
     return {k: (float(v[0]), v[1], v[2]) for k, v in out.items()}
 
@@ -897,7 +926,7 @@ def classification_metrics(y, prob, boot, perm) -> dict:
     Yb, Sb, Hb = y[boot], prob[boot], yhat[boot]
     Yp = y[perm]
     out = {
-        'balanced_accuracy': (_bacc(y, yhat)[0], _bacc(Yb, Hb), _bacc(Yp, yhat[None, :])),
+        'balanced_accuracy': (_bacc(y, yhat)[0], _bacc(Yb, Hb), None),
         'auroc': (_auroc(y, prob)[0], _auroc(Yb, Sb), _auroc(Yp, prob[None, :])),
         'f1_high': (_f1(y, yhat)[0], _f1(Yb, Hb), None),
         'accuracy': ((y == yhat).mean(), (Yb == Hb).mean(-1), None),
@@ -921,6 +950,10 @@ def ci_of(b, level):
         return np.nan, np.nan
     a = (1 - level) / 2
     return float(np.quantile(b, a)), float(np.quantile(b, 1 - a))
+
+
+ASSOCIATION_METRIC = {'regression': 'pearson_r', 'freq_group': 'auroc'}
+CHANCE = {'r2': 0.0, 'balanced_accuracy': 0.5, 'auroc': 0.5}
 
 
 def perm_p_greater(obs, null):
@@ -972,7 +1005,9 @@ def cka(X: np.ndarray, Y: np.ndarray) -> tuple[float, float]:
         return A / s
     X, Y = z(np.asarray(X, np.float64)), z(np.asarray(Y, np.float64))
     K, L = X @ X.T, Y @ Y.T
-    deb = _hsic_unbiased(K, L) / np.sqrt(_hsic_unbiased(K, K) * _hsic_unbiased(L, L))
+    if not np.abs(K).max() > 0 or not np.abs(L).max() > 0:
+        return np.nan, np.nan          # a constant representation: CKA undefined
+    deb = _hsic_unbiased(K, L) / np.sqrt(max(_hsic_unbiased(K, K) * _hsic_unbiased(L, L), 1e-300))
     std = (K * L).sum() / np.sqrt((K * K).sum() * (L * L).sum())   # columns already centred
     return float(deb), float(std)
 
@@ -1134,6 +1169,12 @@ def analyze_condition(spec: ModelConfig, cond: str, feats, toks: pd.DataFrame, w
     sel = (df['probe'] == 'linear_probe') & (df['subset'] == 'all') & df['p_perm'].notna()
     for _, g in df[sel].groupby(['task', 'target', 'target_variant', 'metric']):
         df.loc[g.index, 'p_holm_layers'] = holm(g['p_perm'].values)
+    # attach the association test (pearson_r / auroc permutation, Holm over
+    # layers) to every metric row of the same probe and layer
+    keys = ['task', 'target', 'target_variant', 'layer']
+    assoc = df[sel & (df['metric'] == df['task'].map(ASSOCIATION_METRIC))][keys + ['p_holm_layers']]
+    df = df.merge(assoc.rename(columns={'p_holm_layers': 'p_holm_association'}), on=keys, how='left')
+    df.loc[(df['probe'] != 'linear_probe') | (df['subset'] != 'all'), 'p_holm_association'] = np.nan
     extra = []
     for a in analyses:
         for m in prim[a['id']]:
@@ -1184,7 +1225,8 @@ def within_model_contrasts(spec, cond, seed, store, L, cfg) -> list:
     return out
 
 
-def base_vs_instruct(pair, cond, seed, st_b, st_i, L, cfg) -> list:
+def base_vs_instruct(pair, cond, seed, st_b, st_i, L, cfg, label='instruct_minus_base') -> list:
+    """Paired contrast st_i - st_b (same test words, same bootstrap draws)."""
     out = []
     for key in st_b:
         if len(key) != 2 or key not in st_i:
@@ -1195,7 +1237,7 @@ def base_vs_instruct(pair, cond, seed, st_b, st_i, L, cfg) -> list:
         for l in range(L + 1):
             d = i['boot'][l] - b['boot'][l]
             lo, hi = ci_of(d, cfg.ci)
-            per_layer.append({'comparison': 'instruct_minus_base', 'pair': pair, 'model': pair,
+            per_layer.append({'comparison': label, 'pair': pair, 'model': pair,
                               'condition_id': cond, 'seed': seed, 'analysis': aid, 'metric': metric,
                               'contrast': 'per_layer', 'layer': l, 'delta': float(i['score'][l] - b['score'][l]),
                               'ci_low': lo, 'ci_high': hi, 'p_boot': boot_p_two_sided(d)})
@@ -1204,16 +1246,16 @@ def base_vs_instruct(pair, cond, seed, st_b, st_i, L, cfg) -> list:
             r['p_holm_layers'] = float(p)
         out += per_layer
         kb, ki = b['cv_selected'], i['cv_selected']
-        for label, d, val in (
+        for contrast, d, val in (
                 ('layer_mean_1..L', np.nanmean(i['boot'][1:], 0) - np.nanmean(b['boot'][1:], 0),
                  np.nanmean(i['score'][1:]) - np.nanmean(b['score'][1:])),
                 ('final_layer', i['boot'][L] - b['boot'][L], i['score'][L] - b['score'][L]),
-                (f'cv_selected (base L{kb}, instruct L{ki})', i['boot'][ki] - b['boot'][kb],
+                (f'cv_selected (L{kb} vs L{ki})', i['boot'][ki] - b['boot'][kb],
                  i['score'][ki] - b['score'][kb])):
             lo, hi = ci_of(d, cfg.ci)
-            out.append({'comparison': 'instruct_minus_base', 'pair': pair, 'model': pair,
+            out.append({'comparison': label, 'pair': pair, 'model': pair,
                         'condition_id': cond, 'seed': seed, 'analysis': aid, 'metric': metric,
-                        'contrast': label, 'layer': np.nan, 'delta': float(val), 'ci_low': lo,
+                        'contrast': contrast, 'layer': np.nan, 'delta': float(val), 'ci_low': lo,
                         'ci_high': hi, 'p_boot': boot_p_two_sided(d)})
     return out
 
@@ -1288,8 +1330,9 @@ def ambiguity_exploratory(spec, cond, feats, toks, wt, cfg) -> pd.DataFrame:
 # ════════════════════════════════════════════════════════════════════════════
 # FIGURES
 # ════════════════════════════════════════════════════════════════════════════
-COLORS = {'base': '#2a78d6', 'instruct': '#eb6834'}
-STYLES = {'base': '-', 'instruct': '--'}
+COLORS = {'base': '#2a78d6', 'instruct': '#eb6834', 'random_init': '#1baf7a'}
+STYLES = {'base': '-', 'instruct': '--', 'random_init': ':'}
+LABELS = {'base': 'base', 'instruct': 'instruct', 'random_init': 'random-init control'}
 
 
 def _panel(ax, res, pair, cond, aid_parts, metric, seed, ref, ylab, title, show_baselines=True):
@@ -1299,16 +1342,16 @@ def _panel(ax, res, pair, cond, aid_parts, metric, seed, ref, ylab, title, show_
             (res['seed'] == seed) & (res['task'] == task) & (res['target'] == target) &
             (res['target_variant'] == variant) & (res['metric'] == metric) & (res['subset'] == 'all')]
     n_test = None
-    for cond_name in ('base', 'instruct'):
+    for cond_name in ('base', 'instruct', 'random_init'):
         g = q[(q['condition'] == cond_name) & (q['probe'] == 'linear_probe')].sort_values('layer')
         if g.empty:
             continue
         n_test = int(g['n_test'].iloc[0])
         ax.fill_between(g['layer'], g['ci_low'], g['ci_high'], color=COLORS[cond_name], alpha=0.16, lw=0)
         ax.plot(g['layer'], g['score'], STYLES[cond_name], color=COLORS[cond_name], lw=2,
-                label='base' if cond_name == 'base' else 'instruct')
-        sig = g['p_holm_layers'] < 0.05
-        ax.plot(g.loc[sig, 'layer'], g.loc[sig, 'score'], 'o', ms=3, color=COLORS[cond_name])
+                label=LABELS[cond_name])
+        sig = (g['p_holm_association'] < 0.05) & (g['ci_low'] > ref)
+        ax.plot(g.loc[sig, 'layer'], g.loc[sig, 'score'], 'o', ms=3.5, color=COLORS[cond_name])
     if show_baselines:
         b = q[(q['condition'] == 'base') & q['probe'].str.startswith('baseline:') &
               ~q['probe'].eq('baseline:train_mean')]
@@ -1318,6 +1361,8 @@ def _panel(ax, res, pair, cond, aid_parts, metric, seed, ref, ylab, title, show_
     ax.axhline(ref, color='#b4b3ad', lw=0.8)
     ax.set_title(title + (f'  (n_test={n_test})' if n_test else ''), fontsize=9)
     ax.set_ylabel(ylab, fontsize=8)
+    from matplotlib.ticker import MaxNLocator
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.tick_params(labelsize=7)
     ax.grid(alpha=0.25, lw=0.5)
     ax.spines[['top', 'right']].set_visible(False)
@@ -1359,7 +1404,7 @@ def make_figures(res: pd.DataFrame, comp: pd.DataFrame, ckadf: pd.DataFrame, out
             fig.legend(seen.values(), seen.keys(), loc='upper center', ncol=len(seen), fontsize=8,
                        frameon=False, bbox_to_anchor=(0.5, 1.0))
             fig.suptitle(f'Layerwise recoverability [{cond}] seed={seed}; band = 95% paired-bootstrap CI; '
-                         f'dots = Holm-adjusted permutation p<.05', fontsize=9, y=1.03)
+                         f'dots = Holm-adjusted association p<.05 AND CI above chance', fontsize=9, y=1.03)
             fig.tight_layout()
             for ext in ('png', 'pdf'):
                 fig.savefig(fig_dir / f'{tag}__{cond.replace("|", "_")}__seed{seed}.{ext}',
@@ -1455,6 +1500,10 @@ def run_group(pair: str, specs: list, wt, splits, cfg: Config, out: Path):
             if paired:
                 all_comp += base_vs_instruct(pair, cond, seed, stores['base'], stores['instruct'],
                                              fb.shape[0] - 1, cfg)
+            for v in ('base', 'instruct'):
+                if v in stores and 'random_init' in stores:
+                    all_comp += base_vs_instruct(pair, cond, seed, stores['random_init'], stores[v],
+                                                 loaded[v][1].shape[0] - 1, cfg, label=f'{v}_minus_random_init')
         if paired:
             L = fb.shape[0] - 1
             for layer in range(L + 1):
@@ -1467,7 +1516,8 @@ def run_group(pair: str, specs: list, wt, splits, cfg: Config, out: Path):
                 all_amb.append(ambiguity_exploratory(s, cond, f, t, wt, cfg))
     pd.concat(all_res, ignore_index=True).to_csv(pdir / 'results_long.csv', index=False)
     pd.DataFrame(all_comp).to_csv(pdir / 'comparisons.csv', index=False)
-    pd.DataFrame(all_cka).to_csv(pdir / 'cka.csv', index=False)
+    if all_cka:
+        pd.DataFrame(all_cka).to_csv(pdir / 'cka.csv', index=False)
     if all_amb:
         pd.concat(all_amb, ignore_index=True).to_csv(pdir / 'ambiguity_exploratory.csv', index=False)
     (pdir / 'tokenization_check.json').write_text(json.dumps(tok_check, indent=2))
@@ -1478,7 +1528,7 @@ def run_group(pair: str, specs: list, wt, splits, cfg: Config, out: Path):
 def aggregate(out: Path, cfg: Config, pairs: list):
     def cat(name):
         fs = [out / 'pairs' / safe_name(p) / name for p in pairs]
-        fs = [f for f in fs if f.exists()]
+        fs = [f for f in fs if f.exists() and f.stat().st_size > 2]
         return pd.concat([pd.read_csv(f) for f in fs], ignore_index=True) if fs else pd.DataFrame()
     res, comp, ck, amb = cat('results_long.csv'), cat('comparisons.csv'), cat('cka.csv'), cat('ambiguity_exploratory.csv')
     if res.empty:
@@ -1553,6 +1603,8 @@ def main(argv=None):
     ap.add_argument('--max-words', type=int, default=None, help='debug: random subset of words')
     ap.add_argument('--ambiguity-repeats', type=int, default=Config.ambiguity_repeats)
     ap.add_argument('--skip-ambiguity', action='store_true')
+    ap.add_argument('--random-init-control', action='store_true',
+                    help='also probe an untrained copy of every base architecture (same tokenizer)')
     ap.add_argument('--extract-only', action='store_true')
     ap.add_argument('--analyze-only', action='store_true')
     ap.add_argument('--trust-remote-code', action='store_true')
@@ -1599,6 +1651,11 @@ def main(argv=None):
     if args.custom_model:
         extra = [ModelConfig(*c.split(':', 1)) for c in args.custom_model]
         models = (models if (args.models or args.custom_pair) else []) + extra
+    if args.random_init_control:
+        models = models + [ModelConfig(f'{m.name}-RandomInit', m.model_id, batch_size=m.batch_size,
+                                       family=m.family, variant='random_init', base_of=m.name,
+                                       revision=m.revision, random_init=True)
+                           for m in models if m.variant == 'base']
     specs = group_models(models)
 
     wt, rep = load_and_validate(cfg)
@@ -1690,7 +1747,9 @@ def self_test():
     # 8. permutation null of a useless predictor is ~uniform; of a perfect one is minimal
     boot, perm = resampling(0, 'self', 100, 200, 999)
     met = regression_metrics(yr, yr, 0.0, boot, perm)
-    assert perm_p_greater(met['r2'][0], met['r2'][2]) <= 0.002
+    assert perm_p_greater(met['pearson_r'][0], met['pearson_r'][2]) <= 0.002
+    met0 = regression_metrics(yr, pr, 0.0, boot, perm)
+    assert perm_p_greater(met0['pearson_r'][0], met0['pearson_r'][2]) > 0.01
     # 9. prompt frames: one placeholder, no leakage words
     for f in PROMPT_FRAMES.values():
         assert f['text'].count('{W}') == 1 and not _LEAKY.search(f['text'])
